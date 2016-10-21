@@ -34,6 +34,7 @@ import org.apache.hadoop.io.Writable;
 import org.apache.hadoop.io.serializer.Deserializer;
 import org.apache.hadoop.io.serializer.SerializationFactory;
 import org.apache.hadoop.io.serializer.Serializer;
+import org.apache.hadoop.ipc.RemoteException;
 import org.apache.hadoop.util.Options;
 import org.apache.hadoop.util.Time;
 
@@ -132,39 +133,50 @@ public class WALFile {
         throw new IllegalArgumentException("file modifier options not compatible with stream");
       }
 
+      FileSystem fs = null;
       FSDataOutputStream out;
       boolean ownStream = fileOption != null;
-      if (ownStream) {
-        Path p = fileOption.getValue();
-        FileSystem fs;
-        fs = p.getFileSystem(conf);
-        int bufferSize = bufferSizeOption == null ? getBufferSize(conf) :
-                         bufferSizeOption.getValue();
-        short replication = replicationOption == null
-                            ? fs.getDefaultReplication(p)
-                            : (short) replicationOption.getValue();
-        long blockSize = blockSizeOption == null ? fs.getDefaultBlockSize(p) :
-                         blockSizeOption.getValue();
 
-        if (appendIfExistsOption != null && appendIfExistsOption.getValue()
+      try {
+        if (ownStream) {
+          Path p = fileOption.getValue();
+          fs = p.getFileSystem(conf);
+          int bufferSize = bufferSizeOption == null ? getBufferSize(conf) :
+            bufferSizeOption.getValue();
+          short replication = replicationOption == null ?
+            fs.getDefaultReplication(p) :
+            (short) replicationOption.getValue();
+          long blockSize = blockSizeOption == null ? fs.getDefaultBlockSize(p) :
+            blockSizeOption.getValue();
+
+          if (appendIfExistsOption != null && appendIfExistsOption.getValue()
             && fs.exists(p)) {
-          // Read the file and verify header details
-          try (
-              WALFile.Reader reader =
-                  new WALFile.Reader(conf, WALFile.Reader.file(p), new Reader.OnlyHeaderOption())
-          ) {
-            if (reader.getVersion() != VERSION[3]) {
-              throw new VersionMismatchException(VERSION[3], reader.getVersion());
+            // Read the file and verify header details
+            try (WALFile.Reader reader =
+                   new WALFile.Reader(conf, WALFile.Reader.file(p), new Reader.OnlyHeaderOption())){
+              if (reader.getVersion() != VERSION[3]) {
+                throw new VersionMismatchException(VERSION[3], reader.getVersion());
+              }
+              sync = reader.getSync();
             }
-            sync = reader.getSync();
+            out = fs.append(p, bufferSize);
+            this.appendMode = true;
+          } else {
+            out = fs.create(p, true, bufferSize, replication, blockSize);
           }
-          out = fs.append(p, bufferSize);
-          this.appendMode = true;
         } else {
-          out = fs.create(p, true, bufferSize, replication, blockSize);
+          out = streamOption.getValue();
         }
-      } else {
-        out = streamOption.getValue();
+
+        init(conf, out, ownStream);
+      } catch (RemoteException re) {
+        log.error("Failed creating a WAL Writer: " + re.getMessage());
+        if (re.getClassName().equals(WALConstants.LEASE_EXCEPTION_CLASS_NAME)) {
+          if (fs != null) {
+            fs.close();
+          }
+        }
+        throw re;
       }
 
       init(connectorConfig, out, ownStream);
@@ -473,6 +485,110 @@ public class WALFile {
      */
     public static Option bufferSize(int value) {
       return new BufferSizeOption(value);
+    }
+
+    private static class FileOption extends Options.PathOption
+        implements Option {
+
+      private FileOption(Path value) {
+        super(value);
+      }
+    }
+
+    private static class InputStreamOption
+        extends Options.FSDataInputStreamOption
+        implements Option {
+
+      private InputStreamOption(FSDataInputStream value) {
+        super(value);
+      }
+    }
+
+    private static class StartOption extends Options.LongOption
+        implements Option {
+
+      private StartOption(long value) {
+        super(value);
+      }
+    }
+
+    private static class LengthOption extends Options.LongOption
+        implements Option {
+
+      private LengthOption(long value) {
+        super(value);
+      }
+    }
+
+    private static class BufferSizeOption extends Options.IntegerOption
+        implements Option {
+
+      private BufferSizeOption(int value) {
+        super(value);
+      }
+    }
+
+    // only used directly
+    private static class OnlyHeaderOption extends Options.BooleanOption
+        implements Option {
+
+      private OnlyHeaderOption() {
+        super(true);
+      }
+    }
+
+    public Reader(Configuration conf, Option... opts) throws IOException {
+      // Look up the options, these are null if not set
+      FileOption fileOpt = Options.getOption(FileOption.class, opts);
+      InputStreamOption streamOpt =
+          Options.getOption(InputStreamOption.class, opts);
+      StartOption startOpt = Options.getOption(StartOption.class, opts);
+      LengthOption lenOpt = Options.getOption(LengthOption.class, opts);
+      BufferSizeOption bufOpt = Options.getOption(BufferSizeOption.class, opts);
+      OnlyHeaderOption headerOnly =
+          Options.getOption(OnlyHeaderOption.class, opts);
+
+      // check for consistency
+      if ((fileOpt == null) == (streamOpt == null)) {
+        throw new
+            IllegalArgumentException("File or stream option must be specified");
+      }
+      if (fileOpt == null && bufOpt != null) {
+        throw new IllegalArgumentException("buffer size can only be set when" +
+                                           " a file is specified.");
+      }
+
+      // figure out the real values
+      Path filename = null;
+      FSDataInputStream file;
+      final long len;
+      FileSystem fs = null;
+
+      try {
+        if (fileOpt != null) {
+          filename = fileOpt.getValue();
+          fs = filename.getFileSystem(conf);
+          int bufSize = bufOpt == null ? getBufferSize(conf) : bufOpt.getValue();
+          len = null == lenOpt
+            ? fs.getFileStatus(filename).getLen()
+            : lenOpt.getValue();
+          file = openFile(fs, filename, bufSize, len);
+        } else {
+          len = null == lenOpt ? Long.MAX_VALUE : lenOpt.getValue();
+          file = streamOpt.getValue();
+        }
+        long start = startOpt == null ? 0 : startOpt.getValue();
+        // really set up
+        initialize(filename, file, start, len, conf, headerOnly != null);
+      } catch (RemoteException re) {
+        log.error("Failed creating a WAL Reader: " + re.getMessage());
+        if (re.getClassName().equals(WALConstants.LEASE_EXCEPTION_CLASS_NAME)) {
+          if (fs != null) {
+            fs.close();
+          }
+        }
+        throw re;
+      }
     }
 
     /**

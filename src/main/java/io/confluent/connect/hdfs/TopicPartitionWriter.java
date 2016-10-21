@@ -256,9 +256,9 @@ public class TopicPartitionWriter {
     lastRotate = System.currentTimeMillis();
     if (log.isDebugEnabled() && rotateIntervalMs > 0) {
       log.debug(
-          "Update last rotation timer. Next rotation for {} will be in {}ms",
-          tp,
-          rotateIntervalMs
+        "Update last rotation timer. Next rotation for {} will be in {}ms",
+        tp,
+        rotateIntervalMs
       );
     }
     if (rotateScheduleIntervalMs > 0) {
@@ -385,7 +385,7 @@ public class TopicPartitionWriter {
           closeTempFile();
           appendToWAL();
           commitFile();
-        } catch (DataException e) {
+        } catch (IOException | DataException e) {
           log.error("Exception on topic partition {}: ", tp, e);
           failureTime = System.currentTimeMillis();
           setRetryTimeout(timeoutMs);
