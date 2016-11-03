@@ -75,7 +75,7 @@ public class FSWAL implements WAL {
           flag = true;
           break;
         } else {
-          log.info("Recovering file {} failed, remaining retires {}", fileName, MAX_RETRY-i-1);
+          log.info("Recovering file {} failed, remaining retires {}.", fileName, MAX_RETRY-i-1);
         }
         try {
           Thread.sleep(1000);
@@ -83,7 +83,7 @@ public class FSWAL implements WAL {
           // does nothing
         }
       } catch (IOException ioe) {
-        throw new ConnectException("Error recovering for file " + fileName, ioe);
+        throw new ConnectException("Error recovering file " + fileName, ioe);
       }
     }
 
@@ -169,10 +169,12 @@ public class FSWAL implements WAL {
         }
       }
     } catch (IOException e) {
-      if (e.getMessage().contains("Cannot obtain block length") && !canRecover(logFile)) {
+      if (e.getMessage().contains("Cannot obtain block length") && canRecover(logFile)) {
         // this can happen when the WAL file is corrupted
-        throw new ConnectException(e);
+        return;
       }
+
+      throw new ConnectException(e);
     }
   }
 
