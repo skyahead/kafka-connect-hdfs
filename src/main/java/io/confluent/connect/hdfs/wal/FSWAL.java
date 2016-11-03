@@ -64,6 +64,32 @@ public class FSWAL implements WAL {
     }
   }
 
+  public boolean canRecover(String fileName) throws ConnectException {
+    boolean flag = false;
+    int MAX_RETRY = 10;
+    for (int i=0; i<MAX_RETRY; i++) {
+      try {
+        boolean recovered = storage.recoverFileLease(new Path(fileName));
+        if (recovered) {
+          log.info("Recovering file {} successfully.", fileName);
+          flag = true;
+          break;
+        } else {
+          log.info("Recovering file {} failed, remaining retires {}", fileName, MAX_RETRY-i-1);
+        }
+        try {
+          Thread.sleep(1000);
+        } catch (Exception se) {
+          // does nothing
+        }
+      } catch (IOException ioe) {
+        throw new ConnectException("Error recovering for file " + fileName, ioe);
+      }
+    }
+
+    return flag;
+  }
+
   public void acquireLease() throws ConnectException {
     long sleepIntervalMs = 1000L;
     long MAX_SLEEP_INTERVAL_MS = 16000L;
@@ -76,19 +102,34 @@ public class FSWAL implements WAL {
         }
         break;
       } catch (RemoteException e) {
+        if (e.getMessage().contains("already the current lease holder")) {
+          // we are already holding a lease, should not have tried in the first place. Just return!
+          return;
+        }
+
         if (e.getClassName().equals(leaseException)) {
           log.info("Cannot acquire lease on WAL {}", logFile);
-          try {
-            Thread.sleep(sleepIntervalMs);
-          } catch (InterruptedException ie) {
-            throw new ConnectException(ie);
+
+          if (!canRecover(logFile)) {
+            try {
+              Thread.sleep(sleepIntervalMs);
+            } catch (InterruptedException ie) {
+              throw new ConnectException(ie);
+            }
           }
+
           sleepIntervalMs = sleepIntervalMs * 2;
         } else {
           throw new ConnectException(e);
         }
       } catch (IOException e) {
-        throw new ConnectException("Error creating writer for log file " + logFile, e);
+        if (e.getMessage().contains("Cannot obtain block length") && canRecover(logFile)) {
+          // WAL file is corrupted due to things like i) hdfs is restarted, hard disk full, etc
+          // let us try to force recovering it
+          return;
+        } else {
+          throw new ConnectException("Error creating writer for log file " + logFile, e);
+        }
       }
     }
     if (sleepIntervalMs >= MAX_SLEEP_INTERVAL_MS) {
@@ -128,7 +169,10 @@ public class FSWAL implements WAL {
         }
       }
     } catch (IOException e) {
-      throw new ConnectException(e);
+      if (e.getMessage().contains("Cannot obtain block length") && !canRecover(logFile)) {
+        // this can happen when the WAL file is corrupted
+        throw new ConnectException(e);
+      }
     }
   }
 
